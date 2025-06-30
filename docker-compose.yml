@@ -1,0 +1,175 @@
+version: '3.8'
+
+services:
+  # Database Services
+  postgres:
+    image: postgres:15-alpine
+    container_name: assos-postgres
+    environment:
+      POSTGRES_DB: assos
+      POSTGRES_USER: assos_user
+      POSTGRES_PASSWORD: assos_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - assos-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: assos-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - assos-network
+
+  # MinIO for S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: assos-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: assos_admin
+      MINIO_ROOT_PASSWORD: assos_password
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - assos-network
+
+  # Vector Database (Qdrant)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: assos-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - assos-network
+
+  # NATS Message Queue
+  nats:
+    image: nats:alpine
+    container_name: assos-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+    networks:
+      - assos-network
+
+  # API Gateway (Go)
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: assos-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://assos_user:assos_password@postgres:5432/assos?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+    depends_on:
+      - postgres
+      - redis
+      - nats
+    networks:
+      - assos-network
+
+  # AI Service (Python)
+  ai-service:
+    build:
+      context: ./services/ai-service
+      dockerfile: Dockerfile
+    container_name: assos-ai-service
+    environment:
+      DATABASE_URL: postgres://assos_user:assos_password@postgres:5432/assos?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      QDRANT_URL: http://qdrant:6333
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    networks:
+      - assos-network
+
+  # Video Processor (Rust)  
+  video-processor:
+    build:
+      context: ./services/video-processor
+      dockerfile: Dockerfile
+    container_name: assos-video-processor
+    environment:
+      DATABASE_URL: postgres://assos_user:assos_password@postgres:5432/assos?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: assos_admin
+      S3_SECRET_KEY: assos_password
+      S3_BUCKET: assos-videos
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    networks:
+      - assos-network
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: assos-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    depends_on:
+      - api-gateway
+    networks:
+      - assos-network
+
+  # Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: assos-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - assos-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: assos-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - assos-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  qdrant_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  assos-network:
+    driver: bridge
