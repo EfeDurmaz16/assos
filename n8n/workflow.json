@@ -1,0 +1,114 @@
+{
+  "name": "Automated Video Creation Pipeline",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.manualWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://api-gateway:8080/api/v1/videos",
+        "method": "POST",
+        "authentication": "headerAuth",
+        "sendBody": true,
+        "body": "={{JSON.stringify({\"channel_id\": \"c7a7e5a1-8353-4b39-906b-735b8f413397\", \"title\": \"Automated Video via n8n\", \"metadata\": {\"source\": \"n8n_workflow\"}})}}",
+        "options": {
+          "body": {
+            "contentType": "application/json"
+          }
+        }
+      },
+      "name": "Create Video Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "assos-api-auth",
+          "name": "ASSOS API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "time": 1,
+        "unit": "minutes"
+      },
+      "name": "Wait for AI Script",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        240,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=http://api-gateway:8080/api/v1/videos/{{$node[\"Create Video Record\"].json[\"id\"]}}/process",
+        "method": "POST",
+        "authentication": "headerAuth",
+        "options": {}
+      },
+      "name": "Trigger Video Processing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        240,
+        700
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "assos-api-auth",
+          "name": "ASSOS API Auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Create Video Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Video Record": {
+      "main": [
+        [
+          {
+            "node": "Wait for AI Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for AI Script": {
+      "main": [
+        [
+          {
+            "node": "Trigger Video Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "id": "assos-video-pipeline"
+}
