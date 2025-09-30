@@ -3,11 +3,13 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
+import json
 
 from ..models import AgentResponse
 from ..services.llm_service import LLMService
 from ..database import get_redis, get_qdrant
+from qdrant_client.models import PointStruct
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ class BaseAgent(ABC):
             logger.info(f"Agent {self.name} starting task {task_id} of type {task_type}")
             
             # Load context from memory if needed
-            await self._load_context(task_id, input_data)
+            input_data["context"] = await self._load_context(task_id, input_data)
             
             # Execute the task
             response = await self.execute_task(task_type, input_data)
@@ -59,7 +61,7 @@ class BaseAgent(ABC):
             await self._update_metrics(execution_time, response.confidence_score or 0.8)
             
             # Store results in memory
-            await self._store_results(task_id, response)
+            await self._store_results(task_id, input_data, response)
             
             logger.info(f"Agent {self.name} completed task {task_id} in {execution_time:.2f}s")
             return response
@@ -74,30 +76,49 @@ class BaseAgent(ABC):
                 execution_time=execution_time
             )
             
-            logger.error(f"Agent {self.name} failed task {task_id}: {e}")
+            logger.error(f"Agent {self.name} failed task {task_id}: {e}", exc_info=True)
             return error_response
     
-    async def _load_context(self, task_id: str, input_data: Dict[str, Any]):
+    def _get_collection_name(self, task_type: str) -> Optional[str]:
+        if "research" in task_type or "ideation" in task_type:
+            return "research_data"
+        if "script" in task_type or "content" in task_type:
+            return "video_scripts"
+        if "performance" in task_type or "analytics" in task_type:
+            return "performance_data"
+        return None
+
+    async def _load_context(self, task_id: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Load relevant context from memory and vector database"""
+        context = {}
         try:
             # Load from Redis cache
             redis = await get_redis()
             cached_context = await redis.get(f"agent_context:{self.agent_id}:{task_id}")
             
             if cached_context:
-                self.memory[task_id] = cached_context
+                context['redis_cache'] = json.loads(cached_context)
             
             # Load relevant embeddings from Qdrant
-            if "video_id" in input_data:
+            collection_name = self._get_collection_name(input_data.get("task_type", ""))
+            if collection_name:
                 qdrant = await get_qdrant()
-                # Search for similar tasks/content
-                # This is a placeholder - in a real implementation you would
-                # embed the input and search for similar vectors
+                query_text = json.dumps(input_data)
+                query_vector = await self.llm_service.generate_embeddings(query_text)
+
+                search_result = await qdrant.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    limit=5
+                )
+                context['vector_search_results'] = [hit.payload for hit in search_result]
                 
         except Exception as e:
             logger.warning(f"Failed to load context for task {task_id}: {e}")
-    
-    async def _store_results(self, task_id: str, response: AgentResponse):
+
+        return context
+
+    async def _store_results(self, task_id: str, input_data: Dict[str, Any], response: AgentResponse):
         """Store task results in memory and vector database"""
         try:
             # Store in Redis cache
@@ -109,10 +130,29 @@ class BaseAgent(ABC):
             )
             
             # Store embeddings in Qdrant if we have text content
-            if response.result and isinstance(response.result, dict):
-                # This is a placeholder - in a real implementation you would
-                # create embeddings of the results and store them
-                pass
+            collection_name = self._get_collection_name(input_data.get("task_type", ""))
+            if collection_name and response.result and isinstance(response.result, dict):
+                qdrant = await get_qdrant()
+
+                # Create embedding from result
+                text_to_embed = json.dumps(response.result)
+                vector = await self.llm_service.generate_embeddings(text_to_embed)
+
+                point = PointStruct(
+                    id=str(uuid4()),
+                    vector=vector,
+                    payload={
+                        "task_id": task_id,
+                        "agent_id": self.agent_id,
+                        "agent_name": self.name,
+                        "task_type": input_data.get("task_type"),
+                        "input_data": input_data,
+                        "result": response.result,
+                        "timestamp": time.time()
+                    }
+                )
+
+                await qdrant.upsert(collection_name=collection_name, points=[point], wait=True)
                 
         except Exception as e:
             logger.warning(f"Failed to store results for task {task_id}: {e}")

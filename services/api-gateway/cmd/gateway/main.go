@@ -48,12 +48,14 @@ func main() {
 	channelService := services.NewChannelService(db, redisClient)
 	videoService := services.NewVideoService(db, redisClient, natsConn)
 	aiService := services.NewAIService(db, redisClient, natsConn)
+	analyticsService := services.NewAnalyticsService(cfg.AnalyticsServiceURL)
 
 	// Initialize handlers
 	authHandler := handlers.NewAuthHandler(userService, cfg.JWTSecret)
 	channelHandler := handlers.NewChannelHandler(channelService)
 	videoHandler := handlers.NewVideoHandler(videoService)
 	aiHandler := handlers.NewAIHandler(aiService)
+	analyticsHandler := handlers.NewAnalyticsHandler(analyticsService)
 
 	// Create Fiber app
 	app := fiber.New(fiber.Config{
@@ -126,8 +128,8 @@ func main() {
 
 	// Analytics routes
 	analytics := protected.Group("/analytics")
-	analytics.Get("/dashboard", videoHandler.GetDashboard)
-	analytics.Get("/performance/:video_id", videoHandler.GetPerformance)
+	analytics.Get("/dashboard", analyticsHandler.GetDashboard)
+	analytics.Get("/performance/:video_id", analyticsHandler.GetPerformance)
 
 	// Start server
 	port := os.Getenv("PORT")

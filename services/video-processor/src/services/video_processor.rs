@@ -1,18 +1,17 @@
 use crate::database::Database;
 use crate::error::ProcessorError;
-use crate::models::{Video, VideoScript, Scene, RenderSettings, ProcessingJob};
+use crate::models::{Video, VideoScript, Scene, ProcessingJob};
 use crate::services::S3Service;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
 use tokio::fs;
 use tracing::{info, error, warn};
 use uuid::Uuid;
 use chrono::Utc;
-use rayon::prelude::*;
+use futures::future::join_all;
+use tokio::io::AsyncWriteExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VideoProcessor {
     database: Database,
     s3_service: S3Service,
@@ -34,6 +33,15 @@ impl VideoProcessor {
         // Create temp directory
         fs::create_dir_all(&self.temp_dir).await?;
         info!("Initialized video processor with temp dir: {:?}", self.temp_dir);
+        Ok(())
+    }
+
+    async fn download_file(&self, url: &str, dest_path: &Path) -> Result<()> {
+        let response = reqwest::get(url).await?;
+        let mut dest_file = fs::File::create(dest_path).await?;
+        let content = response.bytes().await?;
+        dest_file.write_all(&content).await?;
+        info!("Downloaded file from {} to {:?}", url, dest_path);
         Ok(())
     }
 
@@ -79,22 +87,32 @@ impl VideoProcessor {
         let video_dir = self.temp_dir.join(video.id.to_string());
         fs::create_dir_all(&video_dir).await?;
 
-        // Generate scenes in parallel
+        // Generate scenes concurrently
         info!("Processing {} scenes", script.scenes.len());
-        let scene_paths: Result<Vec<_>> = script.scenes
-            .par_iter()
+        let scene_futures = script.scenes
+            .iter()
+            .cloned()
             .enumerate()
-            .map(|(i, scene)| self.process_scene(scene, i, &video_dir))
-            .collect();
+            .map(|(i, scene)| {
+                let processor = self.clone();
+                let video_dir_clone = video_dir.clone();
+                tokio::spawn(async move {
+                    processor.process_scene(&scene, i, &video_dir_clone).await
+                })
+            });
 
-        let scene_paths = scene_paths?;
+        let results = join_all(scene_futures).await;
+        let mut scene_paths = Vec::new();
+        for result in results {
+            scene_paths.push(result??); // Propagate errors from spawn and process_scene
+        }
 
         // Combine scenes into final video
         let output_path = video_dir.join("final_video.mp4");
         self.combine_scenes(&scene_paths, &output_path, script).await?;
 
         // Upload to S3
-        let s3_key = format!("videos/{}/final.mp4", video.id);
+        let s3_key = format!("videos/{}/final-{}.mp4", video.id, Utc::now().timestamp());
         let video_url = self.s3_service.upload_file(&output_path, &s3_key).await?;
 
         // Cleanup temp files
@@ -105,22 +123,22 @@ impl VideoProcessor {
         Ok(video_url)
     }
 
-    fn process_scene(&self, scene: &Scene, index: usize, video_dir: &Path) -> Result<PathBuf> {
+    async fn process_scene(&self, scene: &Scene, index: usize, video_dir: &Path) -> Result<PathBuf> {
         let scene_path = video_dir.join(format!("scene_{:03d}.mp4", index));
         
         match scene.content_type.as_str() {
-            "text" => self.create_text_scene(scene, &scene_path),
-            "image" => self.create_image_scene(scene, &scene_path),
-            "video" => self.create_video_scene(scene, &scene_path),
+            "text" => self.create_text_scene(scene, &scene_path).await,
+            "image" => self.create_image_scene(scene, &scene_path).await,
+            "video" => self.create_video_scene(scene, &scene_path).await,
             _ => Err(ProcessorError::Custom(format!("Unknown scene type: {}", scene.content_type)).into()),
         }
     }
 
-    fn create_text_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
+    async fn create_text_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
         info!("Creating text scene: {}", scene.content);
 
         // Use FFmpeg to create a video with text overlay
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.args([
             "-f", "lavfi",
             "-i", &format!("color=c=black:size=1920x1080:duration={}", scene.duration),
@@ -132,7 +150,7 @@ impl VideoProcessor {
             output_path.to_str().unwrap(),
         ]);
 
-        let output = cmd.output()?;
+        let output = cmd.output().await?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
             return Err(ProcessorError::Custom(format!("FFmpeg error: {}", error)).into());
@@ -141,51 +159,61 @@ impl VideoProcessor {
         Ok(output_path.to_path_buf())
     }
 
-    fn create_image_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
-        info!("Creating image scene: {}", scene.content);
+    async fn create_image_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
+        info!("Creating image scene from URL: {}", scene.content);
 
-        // For now, we'll create a simple colored background
-        // In a real implementation, you would download the image from scene.content URL
-        let mut cmd = Command::new("ffmpeg");
+        let image_path = self.temp_dir.join(Uuid::new_v4().to_string());
+        self.download_file(&scene.content, &image_path).await?;
+
+        let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.args([
-            "-f", "lavfi",
-            "-i", &format!("color=c=blue:size=1920x1080:duration={}", scene.duration),
+            "-loop", "1",
+            "-i", image_path.to_str().unwrap(),
+            "-t", &scene.duration.to_string(),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
             "-y",
             output_path.to_str().unwrap(),
         ]);
 
-        let output = cmd.output()?;
+        let output = cmd.output().await?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(ProcessorError::Custom(format!("FFmpeg error: {}", error)).into());
+            warn!("FFmpeg command for image scene failed: {:?}", cmd);
+            return Err(ProcessorError::Custom(format!("FFmpeg error (image scene): {}", error)).into());
         }
 
+        fs::remove_file(&image_path).await?;
         Ok(output_path.to_path_buf())
     }
 
-    fn create_video_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
-        info!("Creating video scene: {}", scene.content);
+    async fn create_video_scene(&self, scene: &Scene, output_path: &Path) -> Result<PathBuf> {
+        info!("Creating video scene from URL: {}", scene.content);
 
-        // For now, create a simple test pattern
-        // In a real implementation, you would download the video from scene.content URL
-        let mut cmd = Command::new("ffmpeg");
+        let video_path = self.temp_dir.join(Uuid::new_v4().to_string());
+        self.download_file(&scene.content, &video_path).await?;
+
+        let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.args([
-            "-f", "lavfi",
-            "-i", &format!("testsrc=duration={}:size=1920x1080:rate=30", scene.duration),
+            "-i", video_path.to_str().unwrap(),
+            "-t", &scene.duration.to_string(),
             "-c:v", "libx264",
+            "-c:a", "aac",
             "-pix_fmt", "yuv420p",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
             "-y",
             output_path.to_str().unwrap(),
         ]);
 
-        let output = cmd.output()?;
+        let output = cmd.output().await?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            return Err(ProcessorError::Custom(format!("FFmpeg error: {}", error)).into());
+            warn!("FFmpeg command for video scene failed: {:?}", cmd);
+            return Err(ProcessorError::Custom(format!("FFmpeg error (video scene): {}", error)).into());
         }
 
+        fs::remove_file(&video_path).await?;
         Ok(output_path.to_path_buf())
     }
 
@@ -203,31 +231,42 @@ impl VideoProcessor {
         fs::write(&concat_file, concat_content).await?;
 
         // Use FFmpeg to concatenate videos
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_file.to_str().unwrap(),
-            "-c", "copy",
-            "-y",
-            output_path.to_str().unwrap(),
-        ]);
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(concat_file.to_str().unwrap());
 
         // Add audio if available
-        if let Some(audio_url) = &script.audio_url {
-            info!("Adding audio track: {}", audio_url);
-            // In a real implementation, you would download and mix the audio
-        }
+        let audio_path = if let Some(audio_url) = &script.audio_url {
+            info!("Downloading audio track: {}", audio_url);
+            let path = output_path.parent().unwrap().join(format!("audio-{}", Uuid::new_v4()));
+            self.download_file(audio_url, &path).await?;
+            cmd.arg("-i").arg(path.to_str().unwrap());
+            cmd.arg("-c:v").arg("copy");
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-shortest"); // Stop encoding when the shortest input stream ends.
+            Some(path)
+        } else {
+            cmd.arg("-c").arg("copy");
+            None
+        };
 
-        let output = cmd.output()?;
+        cmd.arg("-y").arg(output_path.to_str().unwrap());
+
+        let output = cmd.output().await?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
+            warn!("FFmpeg command for combining scenes failed: {:?}", cmd);
             return Err(ProcessorError::Custom(format!("FFmpeg concatenation error: {}", error)).into());
         }
 
-        // Cleanup concat file
-        if let Err(e) = fs::remove_file(&concat_file).await {
-            warn!("Failed to cleanup concat file: {}", e);
+        // Cleanup temp files
+        fs::remove_file(&concat_file).await?;
+        if let Some(path) = audio_path {
+            fs::remove_file(&path).await?;
         }
 
         Ok(())
@@ -242,7 +281,7 @@ impl VideoProcessor {
         let thumbnail_path = thumbnail_dir.join(format!("{}.jpg", video_id));
 
         // Create thumbnail with title text
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.args([
             "-f", "lavfi",
             "-i", "color=c=0x1a1a1a:size=1280x720",
@@ -255,14 +294,15 @@ impl VideoProcessor {
             thumbnail_path.to_str().unwrap(),
         ]);
 
-        let output = cmd.output()?;
+        let output = cmd.output().await?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
+            warn!("FFmpeg command for thumbnail generation failed: {:?}", cmd);
             return Err(ProcessorError::Custom(format!("Thumbnail generation error: {}", error)).into());
         }
 
         // Upload to S3
-        let s3_key = format!("thumbnails/{}.jpg", video_id);
+        let s3_key = format!("thumbnails/{}-{}.jpg", video_id, Utc::now().timestamp());
         let thumbnail_url = self.s3_service.upload_file(&thumbnail_path, &s3_key).await?;
 
         // Update video with thumbnail URL
